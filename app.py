@@ -11,14 +11,42 @@ import time
 # Page config
 st.set_page_config(page_title="Accent Classifier", page_icon="🎤")
 
-st.title("🎤 English Accent Classifier")
-st.markdown("### AI-powered accent analysis from video URLs")
+st.title("🎤 English Accent Classifier for Hiring")
+st.markdown("### AI-powered English accent analysis for candidate evaluation")
 
 # Load model
 @st.cache_resource
 def load_model():
     try:
-        model = tf.keras.models.load_model('english_indian_accent_classifier.h5')
+        # Custom loader for models with batch_shape parameter
+        def load_model_with_custom_objects(model_path):
+            try:
+                # Try to load the model normally
+                model = tf.keras.models.load_model(model_path)
+                return model
+            except Exception as e:
+                if "batch_shape" in str(e):
+                    # Define a custom layer that handles the batch_shape parameter
+                    class CustomInputLayer(tf.keras.layers.InputLayer):
+                        def __init__(self, batch_shape=None, **kwargs):
+                            if batch_shape is not None:
+                                input_shape = batch_shape[1:]  # Convert batch_shape to input_shape
+                                kwargs['input_shape'] = input_shape
+                            super().__init__(**kwargs)
+                    
+                    # Load model with custom objects
+                    model = tf.keras.models.load_model(
+                        model_path,
+                        custom_objects={'InputLayer': CustomInputLayer}
+                    )
+                    return model
+                else:
+                    # Re-raise if it's a different error
+                    raise e
+        
+        # Use the custom loader
+        model = load_model_with_custom_objects('english_indian_accent_classifier.h5')
+        
         with open('accent_mapping.pkl', 'rb') as f:
             accent_mapping = pickle.load(f)
         return model, accent_mapping
@@ -107,58 +135,106 @@ def download_and_extract_audio(url):
         st.error(f"Error: {e}")
         return None
 
+def normalize_like_training(mfcc):
+    """Apply the exact same normalization as used in training"""
+    # This matches the normalize function from the training notebook
+    x = mfcc.shape[0]  # time frames
+    y = mfcc.shape[1]  # features (13)
+    
+    # Flatten for normalization
+    v = mfcc.reshape(-1, x * y)
+    
+    # Calculate norm and prevent division by zero
+    nm = np.linalg.norm(v, axis=1)
+    nm = nm.reshape(-1, 1)
+    nm = np.where(nm == 0, 1, nm)  # Prevent division by zero
+    
+    # Normalize
+    v = v / nm
+    
+    # Reshape back
+    v = v.reshape(-1, x, y)
+    
+    return v[0]  # Return the single sample
+
 def extract_features(audio_path):
-    """Extract MFCC features"""
+    """Extract MFCC features matching the training preprocessing exactly"""
     try:
-        # Check if file exists
+        # Check if file exists and has content
         if not os.path.exists(audio_path):
             st.error(f"Audio file not found: {audio_path}")
             return None
             
-        # Check file size
         file_size = os.path.getsize(audio_path)
         if file_size == 0:
-            st.error("Audio file is empty (0 bytes)")
+            st.error("Audio file is empty")
             return None
-        elif file_size < 1000:  # Less than 1KB
-            st.warning(f"Audio file is very small ({file_size} bytes), may not contain audio")
         
-        st.info(f"Loading audio file: {os.path.basename(audio_path)} ({file_size/1024:.1f} KB)")
+        st.info(f"Processing audio file: {os.path.basename(audio_path)} ({file_size/1024:.1f} KB)")
         
-        # Load audio
+        # Load audio with exact same parameters as training
         try:
+            # Load 5 seconds at 22050 Hz (matching training)
             y, sr = librosa.load(audio_path, sr=22050, duration=5.0)
+            
             if len(y) == 0:
-                st.error("Audio loaded but contains no samples")
+                st.error("No audio samples loaded")
                 return None
+                
+            # Check if audio is too quiet
+            if np.max(np.abs(y)) < 0.01:
+                st.warning("Audio signal is very weak, results may be unreliable")
+            
+            # Trim silence and normalize
+            y, _ = librosa.effects.trim(y, top_db=20)
+            y = librosa.util.normalize(y)
+            
+            # Ensure we have enough audio (pad if necessary)
+            min_length = int(5.0 * sr)  # 5 seconds worth of samples
+            if len(y) < min_length:
+                y = np.pad(y, (0, min_length - len(y)), mode='constant')
+            
             st.info(f"Loaded {len(y)} audio samples at {sr} Hz")
+            
         except Exception as e:
             st.error(f"Failed to load audio: {str(e)}")
             return None
         
-        # Extract MFCC
+        # Extract MFCC with exact same parameters as training
         try:
-            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=2048, hop_length=512)
-            mfcc = mfcc.T  # Transpose to (time, features)
+            mfcc = librosa.feature.mfcc(
+                y=y, 
+                sr=sr, 
+                n_mfcc=13,      # Exactly 13 coefficients
+                n_fft=2048,     # Same FFT size
+                hop_length=512  # Same hop length
+            )
+            
+            # Transpose to match training format: (time_frames, features)
+            mfcc = mfcc.T
             st.info(f"Extracted MFCC features: shape {mfcc.shape}")
+            
         except Exception as e:
             st.error(f"Failed to extract MFCC features: {str(e)}")
             return None
         
-        # Pad/truncate to 499 frames
-        if mfcc.shape[0] < 499:
-            mfcc = np.pad(mfcc, ((0, 499 - mfcc.shape[0]), (0, 0)), mode='constant')
-            st.info(f"Padded features to shape {mfcc.shape}")
-        else:
-            mfcc = mfcc[:499, :]
-            st.info(f"Truncated features to shape {mfcc.shape}")
+        # Ensure exactly 499 time frames (matching training)
+        target_frames = 499
+        if mfcc.shape[0] < target_frames:
+            # Pad with zeros
+            padding = target_frames - mfcc.shape[0]
+            mfcc = np.pad(mfcc, ((0, padding), (0, 0)), mode='constant', constant_values=0)
+            st.info(f"Padded to {target_frames} frames")
+        elif mfcc.shape[0] > target_frames:
+            # Truncate to exact size
+            mfcc = mfcc[:target_frames, :]
+            st.info(f"Truncated to {target_frames} frames")
         
-        # Normalize
-        norm = np.linalg.norm(mfcc.flatten())
-        if norm > 0:
-            mfcc = mfcc / norm
-            
-        return mfcc
+        # Apply the same normalization as training
+        mfcc_normalized = normalize_like_training(mfcc)
+        
+        st.success(f"Features ready: shape {mfcc_normalized.shape}")
+        return mfcc_normalized
         
     except Exception as e:
         st.error(f"Feature extraction failed: {str(e)}")
@@ -167,7 +243,7 @@ def extract_features(audio_path):
         return None
 
 def predict_accent(features):
-    """Predict accent"""
+    """Predict accent using improved logic"""
     try:
         # Reshape for model
         features_input = features.reshape(1, 499, 13)
@@ -194,12 +270,19 @@ def predict_accent(features):
         return None
 
 # Main interface
-st.markdown("### Enter Video URL")
-url = st.text_input("Video URL:", placeholder="https://www.youtube.com/watch?v=...")
+st.markdown("### 📹 Enter Candidate Video URL")
+st.markdown("*Paste any video URL (Loom, YouTube, direct video link, etc.)*")
+url = st.text_input(
+    "Video URL:", 
+    placeholder="https://www.loom.com/share/... or https://youtube.com/watch?v=... or direct video link",
+    help="Supports Loom, YouTube, Vimeo, and most video platforms"
+)
 
-if st.button("🚀 Analyze Accent", type="primary"):
-    if not url:
-        st.warning("Please enter a URL")
+if st.button("🚀 Analyze English Accent", type="primary"):
+    if not url.strip():
+        st.warning("Please enter a video URL")
+    elif not (url.startswith('http://') or url.startswith('https://')):
+        st.warning("Please enter a valid URL starting with http:// or https://")
     else:
         with st.spinner("Processing..."):
             # Step 1: Download
@@ -236,6 +319,10 @@ if st.button("🚀 Analyze Accent", type="primary"):
             status = "Native" if result['is_native'] else "Non-Native"
             st.metric("Speaker Type", status)
         
+        # Quality warnings
+        if result['confidence'] < 60:
+            st.warning("⚠️ Low confidence prediction. Results may be unreliable.")
+        
         # Detailed breakdown
         st.markdown("### Probability Breakdown")
         for accent, prob in sorted(result['all_probs'].items(), key=lambda x: x[1], reverse=True):
@@ -243,39 +330,103 @@ if st.button("🚀 Analyze Accent", type="primary"):
                 st.success(f"**{accent.title()}**: {prob:.1f}% ⭐")
             else:
                 st.info(f"{accent.title()}: {prob:.1f}%")
-        
-        # Hiring recommendation
-        st.markdown("### 💼 Hiring Assessment")
+          # Hiring recommendation
+        st.markdown("### 💼 English Proficiency Assessment")
         if result['is_native']:
+            english_proficiency = "Native"
+            if result['confidence'] > 80:
+                recommendation = "✅ **Excellent English Communication**\n- Native English speaker with clear accent\n- Highly recommended for English-speaking roles"
+            else:
+                recommendation = "✅ **Good English Communication**\n- Native English speaker\n- Suitable for most English-speaking roles"
+            
             st.success(f"""
-            **✅ Native English Speaker**
-            - {result['accent'].title()} accent detected
+            **{english_proficiency} English Speaker**
+            - Accent: {result['accent'].title()}
             - Confidence: {result['confidence']:.1f}%
-            - Excellent for English communication roles
+            
+            {recommendation}
             """)
         else:
-            confidence_level = "High" if result['confidence'] > 80 else "Medium" if result['confidence'] > 60 else "Low"
+            # For Indian English - still English proficient but non-native
+            english_proficiency = "Non-Native (Fluent)"
+            if result['confidence'] > 80:
+                recommendation = "ℹ️ **Fluent English Speaker**\n- Non-native but clear English accent\n- Suitable for most roles with global teams"
+            else:
+                recommendation = "ℹ️ **English Speaker**\n- Non-native accent detected\n- Assess based on role requirements"
+            
             st.info(f"""
-            **ℹ️ Non-Native English Speaker**
-            - {result['accent'].title()} accent detected
-            - Confidence: {result['confidence']:.1f}% ({confidence_level})
-            - Consider role requirements for verbal communication
+            **{english_proficiency} English Speaker**
+            - Accent: {result['accent'].title()}
+            - Confidence: {result['confidence']:.1f}%
+            
+            {recommendation}
             """)
 
 # Instructions
-with st.expander("📝 How to Use"):
+with st.expander("📝 How to Use This Tool"):
     st.markdown("""
-    1. **Paste a video URL** (YouTube, Loom, etc.)
-    2. **Click Analyze Accent**
-    3. **Get instant results** with confidence scores
+    **Steps to Analyze Candidate's English Accent:**
+    1. **Get candidate video**: Ask for Loom recording, YouTube upload, or direct video link
+    2. **Paste the URL** in the field above
+    3. **Click Analyze** and get instant English proficiency assessment
+    4. **Use results** to evaluate English communication skills
     
-    **Supported accents:**
-    - 🇺🇸 American (Native)
-    - 🇬🇧 British (Native)  
-    - 🇦🇺 Australian (Native)
-    - 🏴󠁧󠁢󠁷󠁬󠁳󠁿 Welsh (Native)
-    - 🇮🇳 Indian English (Non-native)
+    **Supported Video Sources:**
+    - 🎬 **Loom recordings** (loom.com links)
+    - 📹 **YouTube videos** (youtube.com/watch links)
+    - 🔗 **Direct video links** (.mp4, .mov, .avi files)
+    - 📺 **Most video platforms** supported by yt-dlp
+    
+    **English Accents Detected:**
+    - 🇺🇸 **American** (Native English)
+    - 🇬🇧 **British** (Native English)  
+    - 🇦🇺 **Australian** (Native English)
+    - 🏴 **Welsh** (Native English)
+    - 🇮🇳 **Indian English** (Non-native but fluent)
+    
+    **Best Practices:**
+    - Use videos with 30+ seconds of clear speech
+    - Ensure minimal background noise
+    - Single speaker preferred
+    - Ask candidates to introduce themselves or describe their experience
+    """)
+
+with st.expander("⚙️ Technical Details"):
+    st.markdown("""
+    **Model Information:**
+    - Architecture: Convolutional Neural Network (CNN)
+    - Features: 13 MFCC coefficients over 499 time frames
+    - Training: AccentDB dataset
+    - Processing: Enhanced feature extraction matching training data
+    
+    **Quality Indicators:**
+    - **Confidence**: How certain the model is about the prediction
+    - Lower confidence may indicate mixed accents or unclear audio
+    """)
+
+with st.expander("📊 Understanding Confidence Scores"):
+    st.markdown("""
+    **Confidence Score Interpretation:**
+    
+    - **90-100%**: Very high confidence - reliable classification
+    - **80-89%**: High confidence - good classification reliability  
+    - **70-79%**: Moderate confidence - generally reliable
+    - **60-69%**: Lower confidence - consider additional samples
+    - **Below 60%**: Low confidence - may need clearer audio or longer sample
+    
+    **Factors Affecting Confidence:**
+    - Audio quality and clarity
+    - Background noise levels
+    - Length of speech sample
+    - Speaker's consistency
+    - Audio compression/encoding
+    
+    **For Hiring Decisions:**
+    - High confidence (80%+) results are reliable for assessment
+    - Lower confidence may indicate mixed accent or unclear audio
+    - Consider requesting additional voice samples if confidence is low
     """)
 
 st.markdown("---")
-st.markdown("**Model Accuracy: 98.5%** | Built for hiring assessment")
+st.markdown("**🎯 Built for Hiring Teams** | Evaluate English communication skills instantly")
+st.markdown("*Model trained on diverse English accents for accurate candidate assessment*")
